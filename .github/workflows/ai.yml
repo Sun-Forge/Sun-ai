@@ -1,0 +1,342 @@
+name: SUN AI - Execute
+
+on:
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: true
+        type: string
+      model:
+        description: 'AI Model to run'
+        required: true
+        type: string
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    
+    env:
+      CHAT_ID: ${{ github.event.inputs.chat_id }}
+      MODEL: ${{ github.event.inputs.model }}
+      GATEWAY_URL: ${{ secrets.GATEWAY_URL }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+    
+    steps:
+      # 1. Checkout repository
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      
+      # 2. Setup Node.js
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      
+      # 3. Setup Tailscale VPN
+      - name: 🔗 Setup Tailscale VPN
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          version: latest
+          args: --advertise-exit-node
+      
+      # 4. Install system dependencies
+      - name: 📦 Install System Dependencies
+        run: |
+          echo "Installing system dependencies..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            curl \
+            wget \
+            git \
+            build-essential \
+            python3 \
+            python3-pip
+          echo "✅ System dependencies installed"
+      
+      # 5. Install Ollama
+      - name: 🤖 Install Ollama
+        run: |
+          echo "Installing Ollama..."
+          curl -fsSL https://ollama.ai/install.sh | sh
+          
+          echo "Verifying Ollama installation..."
+          ollama --version
+          
+          echo "✅ Ollama installed successfully"
+      
+      # 6. Start Ollama service
+      - name: 🚀 Start Ollama Service
+        run: |
+          echo "Starting Ollama service..."
+          nohup ollama serve > ollama.log 2>&1 &
+          OLLAMA_PID=$!
+          echo $OLLAMA_PID > ollama.pid
+          
+          echo "Waiting for Ollama to be ready..."
+          for i in {1..60}; do
+            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+              echo "✅ Ollama is ready (attempt $i/60)"
+              break
+            fi
+            echo "⏳ Waiting for Ollama... ($i/60)"
+            sleep 2
+          done
+          
+          # Verify Ollama is running
+          if ! pgrep -f "ollama serve" > /dev/null; then
+            echo "❌ Ollama failed to start"
+            cat ollama.log
+            exit 1
+          fi
+          echo "✅ Ollama service started (PID: $OLLAMA_PID)"
+      
+      # 7. Pull AI Model
+      - name: 📥 Pull AI Model
+        run: |
+          echo "Pulling model: $MODEL"
+          echo "This may take 5-10 minutes depending on model size..."
+          
+          ollama pull $MODEL
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ Model pulled successfully"
+          else
+            echo "❌ Failed to pull model"
+            exit 1
+          fi
+          
+          echo "Available models:"
+          ollama list
+      
+      # 8. Test Model
+      - name: 🧪 Test AI Model
+        run: |
+          echo "Testing model: $MODEL"
+          
+          RESPONSE=$(curl -s -X POST http://localhost:11434/api/generate \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"$MODEL\",
+              \"prompt\": \"Hello, test this model\",
+              \"stream\": false
+            }")
+          
+          echo "Response: $RESPONSE"
+          
+          if echo "$RESPONSE" | grep -q '"response"'; then
+            echo "✅ Model test passed"
+          else
+            echo "❌ Model test failed"
+            exit 1
+          fi
+      
+      # 9. Create heartbeat script
+      - name: 📝 Create Heartbeat Script
+        run: |
+          cat > heartbeat.sh << 'HEARTBEAT_EOF'
+          #!/bin/bash
+          
+          CHAT_ID="$1"
+          MODEL="$2"
+          RUN_ID="$3"
+          GATEWAY_URL="$4"
+          
+          echo "Starting heartbeat..."
+          echo "Chat ID: $CHAT_ID"
+          echo "Model: $MODEL"
+          echo "Run ID: $RUN_ID"
+          echo "Gateway: $GATEWAY_URL"
+          
+          COUNTER=0
+          while true; do
+            COUNTER=$((COUNTER + 1))
+            
+            # Get model stats from Ollama
+            REQUESTS=$COUNTER
+            TOKENS=$((COUNTER * 10))
+            STATUS="online"
+            
+            # Create heartbeat payload
+            HEARTBEAT_DATA="{
+              \"chat_id\": \"$CHAT_ID\",
+              \"run_id\": \"$RUN_ID\",
+              \"model\": \"$MODEL\",
+              \"status\": \"$STATUS\",
+              \"requests\": $REQUESTS,
+              \"tokens\": $TOKENS
+            }"
+            
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Sending heartbeat..."
+            
+            # Send heartbeat to gateway
+            RESPONSE=$(curl -s -X POST "$GATEWAY_URL/node/update" \
+              -H "Content-Type: application/json" \
+              -d "$HEARTBEAT_DATA" \
+              -w "\n%{http_code}")
+            
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+            BODY=$(echo "$RESPONSE" | head -n -1)
+            
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] HTTP $HTTP_CODE: $BODY"
+            
+            # Check if Ollama is still running
+            if ! pgrep -f "ollama serve" > /dev/null; then
+              echo "❌ Ollama process died, exiting heartbeat"
+              break
+            fi
+            
+            # Wait 5 seconds before next heartbeat
+            sleep 5
+          done
+          HEARTBEAT_EOF
+          
+          chmod +x heartbeat.sh
+          echo "✅ Heartbeat script created"
+      
+      # 10. Start heartbeat in background
+      - name: 💓 Start Heartbeat Service
+        run: |
+          RUN_ID="${{ github.run_id }}"
+          
+          echo "Starting heartbeat service..."
+          ./heartbeat.sh "$CHAT_ID" "$MODEL" "$RUN_ID" "$GATEWAY_URL" > heartbeat.log 2>&1 &
+          HEARTBEAT_PID=$!
+          
+          echo "Heartbeat PID: $HEARTBEAT_PID"
+          echo "$HEARTBEAT_PID" > heartbeat.pid
+          
+          sleep 2
+          
+          if ! pgrep -f "heartbeat.sh" > /dev/null; then
+            echo "❌ Heartbeat failed to start"
+            cat heartbeat.log
+            exit 1
+          fi
+          
+          echo "✅ Heartbeat service started"
+      
+      # 11. Monitor and keep job alive
+      - name: ⏱️ Monitor & Keep Alive (6 Hours)
+        run: |
+          echo "=========================================="
+          echo "🚀 SUN AI Node Started Successfully"
+          echo "=========================================="
+          echo "Chat ID: $CHAT_ID"
+          echo "Model: $MODEL"
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
+          echo "=========================================="
+          echo ""
+          echo "This job will keep the AI model running for up to 6 hours."
+          echo "The job will be automatically cancelled when you delete the AI from the Telegram bot."
+          echo ""
+          echo "Monitor heartbeat status:"
+          echo "tail -f heartbeat.log"
+          echo ""
+          echo "=========================================="
+          
+          # Keep job running - GitHub has a max timeout of 6 hours (360 minutes)
+          # We'll run for 5 hours 55 minutes (35,700 seconds) to leave buffer
+          KEEP_ALIVE_SECONDS=$((5 * 60 * 60 + 55 * 60))
+          
+          echo "Job will run for $KEEP_ALIVE_SECONDS seconds (5h 55m)"
+          
+          # Monitor processes every 30 seconds
+          ELAPSED=0
+          while [ $ELAPSED -lt $KEEP_ALIVE_SECONDS ]; do
+            REMAINING=$((KEEP_ALIVE_SECONDS - ELAPSED))
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Elapsed: ${ELAPSED}s / Remaining: ${REMAINING}s"
+            
+            # Check if Ollama is running
+            if ! pgrep -f "ollama serve" > /dev/null; then
+              echo "⚠️  Ollama process not found"
+            fi
+            
+            # Check if heartbeat is running
+            if ! pgrep -f "heartbeat.sh" > /dev/null; then
+              echo "⚠️  Heartbeat process not found"
+            fi
+            
+            sleep 30
+            ELAPSED=$((ELAPSED + 30))
+          done
+          
+          echo "=========================================="
+          echo "⏰ Job timeout reached (6 hours)"
+          echo "=========================================="
+      
+      # 12. Send offline notification
+      - name: 📤 Send Offline Notification
+        if: always()
+        run: |
+          echo "Sending offline notification..."
+          
+          CHAT_ID="${{ github.event.inputs.chat_id }}"
+          RUN_ID="${{ github.run_id }}"
+          
+          OFFLINE_DATA="{
+            \"chat_id\": \"$CHAT_ID\",
+            \"run_id\": \"$RUN_ID\",
+            \"model\": \"$MODEL\",
+            \"status\": \"offline\",
+            \"requests\": 0,
+            \"tokens\": 0
+          }"
+          
+          curl -s -X POST "$GATEWAY_URL/node/update" \
+            -H "Content-Type: application/json" \
+            -d "$OFFLINE_DATA" || true
+          
+          echo "✅ Offline notification sent"
+      
+      # 13. Cleanup processes
+      - name: 🧹 Cleanup Processes
+        if: always()
+        run: |
+          echo "Cleaning up processes..."
+          
+          # Kill heartbeat
+          if [ -f heartbeat.pid ]; then
+            HEARTBEAT_PID=$(cat heartbeat.pid)
+            kill $HEARTBEAT_PID 2>/dev/null || true
+            echo "✅ Heartbeat process killed"
+          fi
+          
+          # Kill Ollama
+          pkill -f "ollama serve" || true
+          echo "✅ Ollama process killed"
+          
+          sleep 2
+          
+          echo "✅ Cleanup completed"
+      
+      # 14. Upload artifacts and logs
+      - name: 📤 Upload Logs & Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sun-ai-logs-${{ github.run_id }}
+          path: |
+            heartbeat.log
+            ollama.log
+          retention-days: 7
+          if-no-files-found: ignore
+      
+      # 15. Job summary
+      - name: 📊 Job Summary
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "📊 Job Summary"
+          echo "=========================================="
+          echo "Chat ID: $CHAT_ID"
+          echo "Model: $MODEL"
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Status: ${{ job.status }}"
+          echo "Completed at: $(date '+%Y-%m-%d %H:%M:%S')"
+          echo "=========================================="
